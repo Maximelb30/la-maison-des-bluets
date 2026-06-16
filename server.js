@@ -47,9 +47,8 @@ function rewriteCookies(setCookieHeaders) {
   return cookies.map((c) =>
     c
       .replace(/Domain=[^;]+;?\s*/gi, "")
-      .replace(/SameSite=[^;]+;?\s*/gi, "SameSite=Lax; ")
-      .replace(/;\s*Secure/gi, "") // Remove Secure flag for localhost HTTP
-      .replace(/HttpOnly;?\s*/gi, "") // Remove HttpOnly so JS can access if needed
+      .replace(/SameSite=None/gi, "SameSite=Lax")
+      .replace(/HttpOnly;?\s*/gi, "") // Remove HttpOnly so JS can read wf-csrf
   );
 }
 
@@ -125,108 +124,84 @@ const server = http.createServer(async (req, res) => {
             if (debug) debug.textContent = msg;
           }
 
-          // Method 1: Direct GraphQL call (same as Webflow does internally)
-          function addViaGraphQL() {
-            log('Tentative GraphQL directe...');
-            fetch('/.wf_graphql/apollo', {
+          // Step 1: Get CSRF token
+          // Step 2: Use it to add to cart via GraphQL
+          // Step 3: Redirect to checkout
+          function start() {
+            log('Step 1: Getting CSRF token...');
+            fetch('/.wf_graphql/csrf', {
               method: 'POST',
               credentials: 'include',
-              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-              body: JSON.stringify({
-                query: 'mutation AddToCart($skuId: String!, $count: Int!, $buyNow: Boolean) { ecommerceAddToCart(sku: $skuId, count: $count, buyNow: $buyNow) { ok } }',
-                variables: { skuId: SKU_ID, count: 1, buyNow: false }
-              })
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+              },
+              body: '{}'
             })
-            .then(function(r) { return r.json(); })
+            .then(function(r) {
+              log('CSRF status: ' + r.status);
+              return r.json();
+            })
             .then(function(data) {
-              log('GraphQL response: ' + JSON.stringify(data));
-              if (data && data[0] && data[0].data && data[0].data.ecommerceAddToCart && data[0].data.ecommerceAddToCart.ok) {
-                title.textContent = 'Place réservée ! Redirection...';
-                setTimeout(function() { window.location.href = '/checkout'; }, 1000);
-              } else if (data && data.data && data.data.ecommerceAddToCart && data.data.ecommerceAddToCart.ok) {
-                title.textContent = 'Place réservée ! Redirection...';
-                setTimeout(function() { window.location.href = '/checkout'; }, 1000);
+              if (!data.ok) {
+                log('CSRF failed: ' + JSON.stringify(data));
+                return;
+              }
+              log('Step 2: CSRF OK, reading token from cookie...');
+              // Extract wf-csrf token from cookies
+              var csrfToken = '';
+              document.cookie.split(';').forEach(function(c) {
+                var parts = c.trim().split('=');
+                if (parts[0] === 'wf-csrf') csrfToken = parts.slice(1).join('=');
+              });
+              log('CSRF token: ' + csrfToken.slice(0, 20) + '...');
+
+              // Step 2: Add to cart
+              return fetch('/.wf_graphql/apollo', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'X-Wf-CSRF': csrfToken
+                },
+                body: JSON.stringify([{
+                  operationName: 'AddToCart',
+                  query: 'mutation AddToCart($skuId: String!, $count: Int!, $buyNow: Boolean) { ecommerceAddToCart(sku: $skuId, count: $count, buyNow: $buyNow) { ok } }',
+                  variables: { skuId: SKU_ID, count: 1, buyNow: false }
+                }])
+              });
+            })
+            .then(function(r) {
+              if (!r) return;
+              log('AddToCart status: ' + r.status);
+              return r.json();
+            })
+            .then(function(data) {
+              if (!data) return;
+              log('AddToCart response: ' + JSON.stringify(data));
+              var ok = data && data[0] && data[0].data && data[0].data.ecommerceAddToCart && data[0].data.ecommerceAddToCart.ok;
+              if (ok) {
+                title.textContent = 'Place ajoutée ! Redirection vers le paiement...';
+                log('Success! Redirecting to checkout...');
+                setTimeout(function() { window.location.href = '/checkout'; }, 1500);
               } else {
-                log('GraphQL failed, trying form click...');
-                addViaFormClick();
+                title.textContent = 'Erreur lors de l\\'ajout au panier';
+                log('AddToCart failed: ' + JSON.stringify(data));
               }
             })
             .catch(function(err) {
-              log('GraphQL error: ' + err.message + ', trying form click...');
-              addViaFormClick();
+              log('Error: ' + err.message);
+              title.textContent = 'Erreur: ' + err.message;
             });
           }
 
-          // Method 2: Click the actual add-to-cart form (fallback)
-          function addViaFormClick() {
-            var form = document.querySelector('form[data-commerce-sku-id="' + SKU_ID + '"]');
-            if (!form) {
-              log('Form not found, retrying in 1s...');
-              setTimeout(addViaFormClick, 1000);
-              return;
-            }
-            log('Form found, submitting...');
-
-            // Intercept navigation — Webflow will try to go to /checkout after add
-            var origAssign = window.location.assign;
-            var intercepted = false;
-
-            // Watch for XHR/fetch to graphql to know when add-to-cart completes
-            var origFetch = window.fetch;
-            window.fetch = function() {
-              var url = arguments[0];
-              if (typeof url === 'string' && url.indexOf('graphql') !== -1) {
-                log('Intercepted GraphQL fetch');
-                return origFetch.apply(this, arguments).then(function(res) {
-                  return res.clone().json().then(function(data) {
-                    log('Cart response: ' + JSON.stringify(data).slice(0, 100));
-                    if (!intercepted) {
-                      intercepted = true;
-                      title.textContent = 'Place réservée ! Redirection...';
-                      setTimeout(function() { window.location.href = '/checkout'; }, 1500);
-                    }
-                    return res;
-                  });
-                });
-              }
-              return origFetch.apply(this, arguments);
-            };
-
-            // Click the hidden submit button
-            var btn = form.querySelector('input[type="submit"]');
-            if (btn) {
-              btn.style.setProperty('display', 'block', 'important');
-              btn.style.setProperty('visibility', 'visible', 'important');
-              btn.style.setProperty('opacity', '0', 'important');
-              btn.style.setProperty('position', 'fixed', 'important');
-              btn.style.setProperty('top', '-9999px', 'important');
-              btn.click();
-              log('Submit button clicked');
-            }
-
-            // Also try dispatching submit event
-            setTimeout(function() {
-              if (!intercepted) {
-                log('Dispatching submit event...');
-                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-              }
-            }, 500);
-
-            // Safety fallback — redirect after 10s regardless
-            setTimeout(function() {
-              if (!intercepted) {
-                log('Timeout — redirecting anyway');
-                window.location.href = '/checkout';
-              }
-            }, 10000);
-          }
-
-          // Start: wait for page to be fully loaded
+          // Start after page loads
           if (document.readyState === 'complete') {
-            setTimeout(addViaGraphQL, 2000);
+            setTimeout(start, 1000);
           } else {
             window.addEventListener('load', function() {
-              setTimeout(addViaGraphQL, 2000);
+              setTimeout(start, 1000);
             });
           }
         })();
@@ -268,6 +243,8 @@ const server = http.createServer(async (req, res) => {
         Accept: req.headers.accept || "*/*",
         "Accept-Language": req.headers["accept-language"] || "fr",
         "User-Agent": req.headers["user-agent"] || "Mozilla/5.0",
+        "X-Requested-With": req.headers["x-requested-with"] || "",
+        "X-Wf-CSRF": req.headers["x-wf-csrf"] || "",
       },
       body,
     };
