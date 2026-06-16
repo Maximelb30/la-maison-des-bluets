@@ -104,58 +104,131 @@ const server = http.createServer(async (req, res) => {
       let html = await pageRes.text();
       html = rewriteHtml(html);
 
-      // Inject script that auto-clicks the right "Réserver" button
+      // Inject script that auto-adds to cart via GraphQL (same as Webflow's own mechanism)
       const autoAddScript = `
         <script>
         (function() {
-          // Wait for Webflow Commerce JS to initialize
-          function tryAddToCart() {
-            var form = document.querySelector('form[data-commerce-sku-id="${show.skuId}"]');
-            if (!form) {
-              console.log('Form not found yet, retrying...');
-              setTimeout(tryAddToCart, 500);
-              return;
-            }
-            // Make the hidden submit button clickable and click it
-            var btn = form.querySelector('input[type="submit"]');
-            if (btn) {
-              btn.style.display = 'block';
-              btn.style.position = 'fixed';
-              btn.style.top = '-9999px';
-              btn.click();
-              console.log('Add to cart clicked for ${show.label}');
-            } else {
-              form.requestSubmit();
-            }
-          }
-          // Show a loading overlay
+          var SKU_ID = "${show.skuId}";
+          var LABEL = "${show.label}";
+
+          // Show loading overlay
           var overlay = document.createElement('div');
           overlay.style.cssText = 'position:fixed;inset:0;background:#0a0a0fee;z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;font-family:Georgia,serif;color:#f0e6d3';
-          overlay.innerHTML = '<div style="text-align:center"><div style="width:40px;height:40px;border:3px solid rgba(196,166,224,0.2);border-top-color:#c4a6e0;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 1.5rem"></div><h2>Ajout au panier...</h2><p style="opacity:0.6;margin-top:0.5rem">${show.label}</p></div><style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
+          overlay.innerHTML = '<div style="text-align:center" id="ol-content"><div style="width:40px;height:40px;border:3px solid rgba(196,166,224,0.2);border-top-color:#c4a6e0;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 1.5rem"></div><h2 id="ol-title">Ajout au panier...</h2><p style="opacity:0.6;margin-top:0.5rem">' + LABEL + '</p><p id="ol-debug" style="font-size:0.7rem;opacity:0.3;margin-top:1rem;font-family:monospace"></p></div><style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
           document.body.appendChild(overlay);
 
-          // Wait for Webflow JS to load, then add to cart
-          var checkReady = setInterval(function() {
-            if (window.Webflow && document.querySelector('form[data-commerce-sku-id="${show.skuId}"]')) {
-              clearInterval(checkReady);
-              setTimeout(tryAddToCart, 1000);
-            }
-          }, 300);
+          var debug = document.getElementById('ol-debug');
+          var title = document.getElementById('ol-title');
 
-          // Listen for navigation to /checkout (Webflow redirects after add-to-cart)
-          var origPush = history.pushState;
-          history.pushState = function() {
-            origPush.apply(this, arguments);
-            if (arguments[2] && arguments[2].includes && arguments[2].includes('checkout')) {
-              window.location.href = '/checkout';
-            }
-          };
+          function log(msg) {
+            console.log('[PIRATE]', msg);
+            if (debug) debug.textContent = msg;
+          }
 
-          // Also watch for direct navigation
-          setTimeout(function() {
-            overlay.querySelector('h2').textContent = 'Redirection vers le paiement...';
-            window.location.href = '/checkout';
-          }, 8000);
+          // Method 1: Direct GraphQL call (same as Webflow does internally)
+          function addViaGraphQL() {
+            log('Tentative GraphQL directe...');
+            fetch('/.wf_graphql/apollo', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({
+                query: 'mutation AddToCart($skuId: String!, $count: Int!, $buyNow: Boolean) { ecommerceAddToCart(sku: $skuId, count: $count, buyNow: $buyNow) { ok } }',
+                variables: { skuId: SKU_ID, count: 1, buyNow: false }
+              })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+              log('GraphQL response: ' + JSON.stringify(data));
+              if (data && data[0] && data[0].data && data[0].data.ecommerceAddToCart && data[0].data.ecommerceAddToCart.ok) {
+                title.textContent = 'Place réservée ! Redirection...';
+                setTimeout(function() { window.location.href = '/checkout'; }, 1000);
+              } else if (data && data.data && data.data.ecommerceAddToCart && data.data.ecommerceAddToCart.ok) {
+                title.textContent = 'Place réservée ! Redirection...';
+                setTimeout(function() { window.location.href = '/checkout'; }, 1000);
+              } else {
+                log('GraphQL failed, trying form click...');
+                addViaFormClick();
+              }
+            })
+            .catch(function(err) {
+              log('GraphQL error: ' + err.message + ', trying form click...');
+              addViaFormClick();
+            });
+          }
+
+          // Method 2: Click the actual add-to-cart form (fallback)
+          function addViaFormClick() {
+            var form = document.querySelector('form[data-commerce-sku-id="' + SKU_ID + '"]');
+            if (!form) {
+              log('Form not found, retrying in 1s...');
+              setTimeout(addViaFormClick, 1000);
+              return;
+            }
+            log('Form found, submitting...');
+
+            // Intercept navigation — Webflow will try to go to /checkout after add
+            var origAssign = window.location.assign;
+            var intercepted = false;
+
+            // Watch for XHR/fetch to graphql to know when add-to-cart completes
+            var origFetch = window.fetch;
+            window.fetch = function() {
+              var url = arguments[0];
+              if (typeof url === 'string' && url.indexOf('graphql') !== -1) {
+                log('Intercepted GraphQL fetch');
+                return origFetch.apply(this, arguments).then(function(res) {
+                  return res.clone().json().then(function(data) {
+                    log('Cart response: ' + JSON.stringify(data).slice(0, 100));
+                    if (!intercepted) {
+                      intercepted = true;
+                      title.textContent = 'Place réservée ! Redirection...';
+                      setTimeout(function() { window.location.href = '/checkout'; }, 1500);
+                    }
+                    return res;
+                  });
+                });
+              }
+              return origFetch.apply(this, arguments);
+            };
+
+            // Click the hidden submit button
+            var btn = form.querySelector('input[type="submit"]');
+            if (btn) {
+              btn.style.setProperty('display', 'block', 'important');
+              btn.style.setProperty('visibility', 'visible', 'important');
+              btn.style.setProperty('opacity', '0', 'important');
+              btn.style.setProperty('position', 'fixed', 'important');
+              btn.style.setProperty('top', '-9999px', 'important');
+              btn.click();
+              log('Submit button clicked');
+            }
+
+            // Also try dispatching submit event
+            setTimeout(function() {
+              if (!intercepted) {
+                log('Dispatching submit event...');
+                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+              }
+            }, 500);
+
+            // Safety fallback — redirect after 10s regardless
+            setTimeout(function() {
+              if (!intercepted) {
+                log('Timeout — redirecting anyway');
+                window.location.href = '/checkout';
+              }
+            }, 10000);
+          }
+
+          // Start: wait for page to be fully loaded
+          if (document.readyState === 'complete') {
+            setTimeout(addViaGraphQL, 2000);
+          } else {
+            window.addEventListener('load', function() {
+              setTimeout(addViaGraphQL, 2000);
+            });
+          }
         })();
         </script>
       `;
